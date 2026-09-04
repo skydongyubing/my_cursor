@@ -2,10 +2,10 @@
 
 
 a = Analysis(
-    ['D:\\my_cursor\\src\\main.py'],
+    ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('ui', 'ui')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -35,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['威宇佳烧录工具.ico'],
+    icon=['D:\\my_cursor\\威宇佳烧录工具.ico'],
 )
