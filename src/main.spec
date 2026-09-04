@@ -1,11 +1,19 @@
 # -*- mode: python ; coding: utf-8 -*-
+"""PyInstaller spec for 威宇佳烧录.
 
+Build from repo root (paths resolve relative to this spec file):
+
+    pyinstaller --noconfirm --clean --workpath src\\build --distpath src\\dist src\\main.spec
+"""
+import os
+
+ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
 
 a = Analysis(
-    ['main.py'],
-    pathex=[],
+    ["main.py"],
+    pathex=[ROOT],
     binaries=[],
-    datas=[('ui', 'ui')],
+    datas=[],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -22,7 +30,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='main',
+    name="威宇佳烧录1.4",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -35,5 +43,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['D:\\my_cursor\\威宇佳烧录工具.ico'],
+    icon=os.path.join(ROOT, "威宇佳烧录工具.ico"),
 )
