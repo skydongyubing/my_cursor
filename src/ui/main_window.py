@@ -10,7 +10,7 @@ from typing import List, Optional
 
 import serial
 import serial.tools.list_ports
-from PySide6.QtCore import QObject, QSettings, QThread, Signal, Slot
+from PySide6.QtCore import QObject, QSettings, QThread, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -242,7 +242,7 @@ class FlashWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("STM32F407 UART 烧录")
+        self.setWindowTitle("WYJ PROGRAM")
         self.resize(720, 560)
         self._backend = SerialBackend()
         self._flash_thread: Optional[QThread] = None
@@ -252,6 +252,9 @@ class MainWindow(QMainWindow):
         self._boot_thread: Optional[QThread] = None
         self._boot_worker: Optional[BootCmdWorker] = None
         self._settings = QSettings("STM32UartProgrammer", "MainWindow")
+        self._port_watch = QTimer(self)
+        self._port_watch.setInterval(1000)
+        self._port_watch.timeout.connect(self._watch_port_alive)
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -356,7 +359,10 @@ class MainWindow(QMainWindow):
     def _restore_port_selection(self) -> None:
         last = self._settings.value("last_port", "", str)
         if last:
-            i = self._port_combo.findText(last)
+            i = self._port_combo.findData(last)
+            if i < 0:
+                # 兼容旧版本保存的显示文本
+                i = self._port_combo.findText(last)
             if i >= 0:
                 self._port_combo.setCurrentIndex(i)
         last_file = self._settings.value("last_hex", "", str)
@@ -370,21 +376,33 @@ class MainWindow(QMainWindow):
         self._settings.setValue("dtr_ms", self._dtr_ms.value())
         self._settings.setValue("last_hex", self._file_edit.text())
         self._settings.setValue("verify", self._verify_check.isChecked())
-        self._settings.setValue("last_port", self._port_combo.currentText())
+        self._settings.setValue(
+            "last_port", self._port_combo.currentData() or self._port_combo.currentText()
+        )
         self._settings.setValue("baud", self._baud_combo.currentText())
         self._settings.setValue("parity", self._parity_combo.currentData())
 
     @Slot()
     def _refresh_ports(self) -> None:
-        current = self._port_combo.currentText()
+        current = self._port_combo.currentData() or self._port_combo.currentText()
         self._port_combo.clear()
-        ports: List[str] = []
+        entries: List[tuple[str, str]] = []
         for p in serial.tools.list_ports.comports():
-            ports.append(p.device)
-        for d in sorted(ports):
-            self._port_combo.addItem(d)
+            desc = (p.description or "").strip()
+            # Windows 下 description 常自带 "(COMx)" 后缀，去掉避免重复
+            desc = re.sub(r"\s*\((COM\d+)\)\s*$", "", desc, flags=re.IGNORECASE)
+            text = f"{p.device} — {desc}" if desc and desc != p.device else p.device
+            entries.append((p.device, text))
+
+        def natural_key(e: tuple[str, str]):
+            # COM2 排在 COM10 前面的自然排序
+            return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", e[0])]
+
+        for device, text in sorted(entries, key=natural_key):
+            # text 用于显示，userData 存真实设备名（COM 口），连接时取用
+            self._port_combo.addItem(text, device)
         if current:
-            i = self._port_combo.findText(current)
+            i = self._port_combo.findData(current)
             if i >= 0:
                 self._port_combo.setCurrentIndex(i)
 
@@ -397,7 +415,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _connect(self) -> None:
-        port = self._port_combo.currentText().strip()
+        port = self._port_combo.currentData() or self._port_combo.currentText().strip()
         if not port:
             QMessageBox.warning(self, "串口", "请选择串口")
             return
@@ -422,10 +440,12 @@ class MainWindow(QMainWindow):
         self._btn_connect.setEnabled(False)
         self._btn_disconnect.setEnabled(True)
         self._btn_read_info.setEnabled(True)
+        self._port_watch.start()
         self._save_settings()
 
     @Slot()
     def _disconnect(self) -> None:
+        self._port_watch.stop()
         try:
             self._backend.set_rts(True)
             self._backend.set_dtr(True)
@@ -436,6 +456,17 @@ class MainWindow(QMainWindow):
         self._btn_connect.setEnabled(True)
         self._btn_disconnect.setEnabled(False)
         self._btn_read_info.setEnabled(False)
+
+    @Slot()
+    def _watch_port_alive(self) -> None:
+        # 工作线程占用期间不介入；端口失效会让工作线程自行报错，结束后下一轮再自动断开
+        if self._flash_worker or self._info_worker or self._boot_worker:
+            return
+        if self._backend.check_alive():
+            return
+        self._port_watch.stop()
+        self._append_log("检测到串口断开（设备拔出或失效）")
+        self._disconnect()
 
     @Slot()
     def _read_bootloader_info(self) -> None:
@@ -555,6 +586,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._save_settings()
+        self._port_watch.stop()
         for thread in (self._flash_thread, self._info_thread, self._boot_thread):
             if thread and thread.isRunning():
                 thread.quit()

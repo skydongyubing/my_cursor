@@ -65,8 +65,22 @@ class SerialBackend:
                 try:
                     if self._ser.is_open:
                         self._ser.close()
+                except Exception:
+                    # 设备已拔出时关闭可能抛异常，确保句柄引用仍被清理
+                    pass
                 finally:
                     self._ser = None
+
+    def check_alive(self) -> bool:
+        """轻量探测串口是否仍有效（设备拔出返回 False）。"""
+        with self._lock:
+            if self._ser is None or not self._ser.is_open:
+                return False
+            try:
+                self._ser.in_waiting
+            except (serial.SerialException, OSError):
+                return False
+            return True
 
     def reconfigure(
         self,
