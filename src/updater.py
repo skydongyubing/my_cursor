@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -33,9 +34,26 @@ CHUNK = 64 * 1024
 _UA = {"User-Agent": "wyj-programmer"}
 
 
+def _quoted_url(url: str) -> str:
+    """对 URL path 中的非 ASCII 字符（如中文文件名）做百分号编码，其余保持不变。"""
+    sp = urllib.parse.urlsplit(url)
+    path = urllib.parse.quote(sp.path, safe="/%")
+    return urllib.parse.urlunsplit((sp.scheme, sp.netloc, path, sp.query, sp.fragment))
+
+
+class _QuotingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """跟随重定向时对 Location 再次百分号编码（Gitee 附件重定向会带中文文件名）。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return super().redirect_request(req, fp, code, msg, headers, _quoted_url(newurl))
+
+
+_OPENER = urllib.request.build_opener(_QuotingRedirectHandler)
+
+
 def _fetch(url: str, timeout: float = 15.0) -> bytes:
-    req = urllib.request.Request(url, headers=_UA)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    req = urllib.request.Request(_quoted_url(url), headers=_UA)
+    with _OPENER.open(req, timeout=timeout) as r:
         return r.read()
 
 
@@ -124,10 +142,10 @@ class UpdateDownloadWorker(QObject):
     def run(self) -> None:
         tmp = Path(tempfile.gettempdir()) / f"wyj_update_{os.getpid()}.exe"
         try:
-            req = urllib.request.Request(self._url, headers=_UA)
+            req = urllib.request.Request(_quoted_url(self._url), headers=_UA)
             recv = 0
             last = -1
-            with urllib.request.urlopen(req, timeout=30) as r, open(tmp, "wb") as f:
+            with _OPENER.open(req, timeout=30) as r, open(tmp, "wb") as f:
                 total = int(r.headers.get("Content-Length") or 0)
                 while True:
                     block = r.read(CHUNK)
