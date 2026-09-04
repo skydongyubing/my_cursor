@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import threading
-import time
 from typing import Optional
 
 import serial
@@ -122,18 +121,6 @@ class SerialBackend:
             if self._ser is None or not self._ser.is_open:
                 raise RuntimeError("Port not open")
             self._ser.rts = level
-
-    def dtr_pulse_low_ms(self, duration_ms: int) -> None:
-        """Drive DTR low for duration_ms, then release high (typical USB-UART reset)."""
-        duration_ms = max(1, min(duration_ms, 5000))
-        with self._lock:
-            if self._ser is None or not self._ser.is_open:
-                raise RuntimeError("Port not open")
-            self._ser.dtr = False
-        time.sleep(duration_ms / 1000.0)
-        with self._lock:
-            if self._ser is not None and self._ser.is_open:
-                self._ser.dtr = True
 
     def as_bootloader_serial(self) -> "_BootloaderSerialAdapter":
         """Adapter exposing .timeout + read/write for Stm32UartBootloader."""

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import threading
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -42,16 +43,61 @@ def _parse_hex_bytes(text: str) -> bytes:
     return bytes(int(s[i : i + 2], 16) for i in range(0, len(s), 2))
 
 
-def _parse_hex_addr(text: str) -> int:
-    t = text.strip()
-    if t.startswith("0x") or t.startswith("0X"):
-        return int(t, 16)
-    return int(t, 16) if re.match(r"^[0-9a-fA-F]+$", t) else int(t, 0)
+class ReadInfoWorker(QObject):
+    finished = Signal()
+    info_ready = Signal(int, int, bool)
+    failed = Signal(str)
+
+    def __init__(self, backend: SerialBackend) -> None:
+        super().__init__()
+        self._backend = backend
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            bl = Stm32UartBootloader(self._backend.as_bootloader_serial())
+            bl.sync()
+            pid = bl.cmd_get_id()
+            self.info_ready.emit(bl.version, pid, bl.extended_erase)
+        except Exception as e:
+            self.failed.emit(str(e))
+        finally:
+            self.finished.emit()
+
+
+class _Cancelled(Exception):
+    """Internal: user requested cancel."""
+
+
+class BootCmdWorker(QObject):
+    """Sends the BOOTLOADER command and reads the 7-byte reply off the UI thread."""
+
+    finished = Signal()
+    replied = Signal(bytes)
+    failed = Signal(str)
+
+    def __init__(self, backend: SerialBackend, payload: bytes) -> None:
+        super().__init__()
+        self._backend = backend
+        self._payload = payload
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self._backend.reset_input_buffer()
+            self._backend.write(self._payload)
+            time.sleep(0.1)
+            self.replied.emit(bytes(self._backend.read(7)))
+        except OSError as e:
+            self.failed.emit(str(e))
+        finally:
+            self.finished.emit()
 
 
 class FlashWorker(QObject):
     finished = Signal()
     success = Signal()
+    cancelled = Signal()
     failed = Signal(str)
     log_line = Signal(str)
     progress = Signal(int, int)
@@ -62,6 +108,11 @@ class FlashWorker(QObject):
         self._firmware_path = firmware_path
         self._base_addr = base_addr
         self._verify = verify
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        """线程安全：请求在当前 256B 块写入后停止。"""
+        self._cancel.set()
 
     @Slot()
     def run(self) -> None:
@@ -73,64 +124,34 @@ class FlashWorker(QObject):
             adapter = self._backend.as_bootloader_serial()
             adapter.timeout = 5.0
             bl = Stm32UartBootloader(adapter)
-            bl._ser.timeout = 5.0
 
             cfg = self._backend.get_config()
             self.log_line.emit(f"配置: baud={cfg.get('baudrate')} bits={cfg.get('bytesize')} parity={cfg.get('parity')} stop={cfg.get('stopbits')}")
             self._backend.reset_input_buffer()
 
             self.log_line.emit("开始烧录流程...")
-            time.sleep(4.0)
-            self._backend.reset_input_buffer()
-            
-            ser = self._backend._ser
-            
-            def expect_ack(ser, timeout_s=1.0) -> bytes:
-                old = ser.timeout
-                ser.timeout = timeout_s
-                try:
-                    b = ser.read(1)
-                finally:
-                    ser.timeout = old
-                if not b:
-                    raise BootloaderError("等待 ACK 超时")
-                if b[0] != 0x79:
-                    raise BootloaderError(f"期望 ACK (0x79)，收到 0x{b[0]:02X}")
-                return b
 
-            self.log_line.emit("1. 发送 Read 命令 0x11...")
-            ser.write(bytes([0x11]))
-            time.sleep(1.0)
-            ser.write(bytes([0xEE]))
-            ack = expect_ack(ser)
-            self.log_line.emit(f"   收到: {ack.hex()}")
+            if self._cancel.is_set():
+                raise _Cancelled()
 
-            self.log_line.emit("2. 发送地址 0x08...")
-            ser.write(bytes([0x08, 0x00, 0x00, 0x00, 0x08]))
-            ack = expect_ack(ser)
-            self.log_line.emit(f"   收到: {ack.hex()}")
-            
-            self.log_line.emit("3. 发送 Get 命令 0x00 0xFF...")
-            ser.write(bytes([0x00, 0xFF]))
-            resp = ser.read(2)
-            self.log_line.emit(f"   收到: {resp.hex() if resp else 'None'}")
-            if not resp or resp[0] != 0x79:
-                raise BootloaderError(f"Get 命令期望 ACK (0x79)，收到 {resp.hex() if resp else 'None'}")
+            self.log_line.emit("等待 Bootloader 应答 (0x7F)...")
+            try:
+                adapter.timeout = 0.5
+                bl.wait_bootloader_ready(retries=15, delay_s=0.2)
+                self.log_line.emit(f"   Bootloader 已就绪, 版本 0x{bl.version:02X}")
+            except BootloaderError as e:
+                # 0x7F 同步失败不中断，保留旧探测流程兜底。
+                self.log_line.emit(f"   0x7F 同步失败，继续探测流程: {e}")
+            finally:
+                adapter.timeout = 5.0
 
-            self.log_line.emit("4. 发送 Erase 命令 0x44...")
-            ser.write(bytes([0x44]))
-            time.sleep(0.00019)
-            ser.write(bytes([0xBB]))
-            ack = expect_ack(ser)
-            self.log_line.emit(f"   收到: {ack.hex()}")
-            
-            self.log_line.emit("5. 发送擦除参数...")
-            ser.write(bytes([0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x03]))
-            time.sleep(0.7)
-            ack = expect_ack(ser)
-            self.log_line.emit(f"   收到: {ack.hex()}")
-            
-            self.log_line.emit("擦除完成...")
+            self.log_line.emit("发送探测读取 (0x11)...")
+            probe_data = bl.probe()
+            self.log_line.emit(f"   探测成功, 数据 0x{probe_data:02X}")
+
+            self.log_line.emit("执行全片擦除 (0x44)...")
+            bl.cmd_erase_all()
+            self.log_line.emit("   擦除完成")
 
             self.log_line.emit("开始写入 Flash...")
 
@@ -138,6 +159,8 @@ class FlashWorker(QObject):
             is_hex = firmware_ext == ".hex"
 
             def prog(cur: int, total: int) -> None:
+                if self._cancel.is_set():
+                    raise _Cancelled()
                 self.progress.emit(cur, total)
 
             if is_hex:
@@ -164,13 +187,15 @@ class FlashWorker(QObject):
                     for off in range(0, len(s.data), 256):
                         chunk = s.data[off : off + 256]
                         addr = s.address + off
-                        if chunk == bytes([0x00] * len(chunk)):
+                        # 只跳过与擦除态一致的全 0xFF 块（全 0x00 块必须写入，
+                        # 否则芯片里会残留 0xFF 导致数据错误）。
+                        if chunk == b"\xFF" * len(chunk):
                             skipped += 1
                             continue
                         chunks.append((addr, chunk))
                         total += len(chunk)
                 if skipped > 0:
-                    self.log_line.emit(f"跳过 {skipped} 块全 0x00 数据")
+                    self.log_line.emit(f"跳过 {skipped} 块全 0xFF 数据")
 
                 self.log_line.emit(f"共 {len(chunks)} 块写入数据，总字节数 {total}")
                 written = 0
@@ -201,6 +226,9 @@ class FlashWorker(QObject):
                     self.log_line.emit("校验通过")
             self.log_line.emit("完成")
             self.success.emit()
+        except _Cancelled:
+            self.log_line.emit("已取消：Flash 可能只写入了部分数据，请重新烧录")
+            self.cancelled.emit()
         except BootloaderError as e:
             self.failed.emit(str(e))
         except OSError as e:
@@ -219,6 +247,10 @@ class MainWindow(QMainWindow):
         self._backend = SerialBackend()
         self._flash_thread: Optional[QThread] = None
         self._flash_worker: Optional[FlashWorker] = None
+        self._info_thread: Optional[QThread] = None
+        self._info_worker: Optional[ReadInfoWorker] = None
+        self._boot_thread: Optional[QThread] = None
+        self._boot_worker: Optional[BootCmdWorker] = None
         self._settings = QSettings("STM32UartProgrammer", "MainWindow")
 
         root = QWidget()
@@ -290,7 +322,13 @@ class MainWindow(QMainWindow):
         flash_form.addRow("", self._verify_check)
         self._btn_flash = QPushButton("擦除并烧录")
         self._btn_flash.setToolTip("要求 MCU 已进入 ROM UART Bootloader；校验位通常为 EVEN。")
-        flash_form.addRow("", self._btn_flash)
+        self._btn_cancel = QPushButton("取消")
+        self._btn_cancel.setEnabled(False)
+        self._btn_cancel.setToolTip("在当前 256 字节块写入后停止烧录。")
+        row_flash = QHBoxLayout()
+        row_flash.addWidget(self._btn_flash)
+        row_flash.addWidget(self._btn_cancel)
+        flash_form.addRow("", row_flash)
         layout.addWidget(flash_box)
 
         self._progress = QProgressBar()
@@ -310,6 +348,7 @@ class MainWindow(QMainWindow):
         self._btn_boot.clicked.connect(self._send_bootloader_cmd)
         self._btn_browse.clicked.connect(self._browse_bin)
         self._btn_flash.clicked.connect(self._start_flash)
+        self._btn_cancel.clicked.connect(self._cancel_flash)
 
         self._refresh_ports()
         self._restore_port_selection()
@@ -377,7 +416,6 @@ class MainWindow(QMainWindow):
             self._backend.set_rts(False)
             self._backend.set_dtr(False)
             self._backend.reset_input_buffer()
-            time.sleep(0.5)  # 等待 MCU 稳定
         except Exception:
             pass
         self._append_log(f"已连接 {port} @ {baud} {parity_to_label(self._current_parity())}")
@@ -404,16 +442,40 @@ class MainWindow(QMainWindow):
         if not self._backend.is_open:
             QMessageBox.warning(self, "串口", "请先连接串口")
             return
-        try:
-            from src.stm32_uart_bootloader import Stm32UartBootloader
-            bl = Stm32UartBootloader(self._backend.as_bootloader_serial())
-            bl.sync()
-            pid = bl.cmd_get_id()
-            self._append_log(f"Bootloader 版本: 0x{bl.version:02X}")
-            self._append_log(f"芯片 PID: 0x{pid:04X}")
-            self._append_log(f"扩展擦除: {'是' if bl.extended_erase else '否'}")
-        except Exception as e:
-            QMessageBox.critical(self, "Bootloader", f"读取失败: {e}")
+        self._btn_read_info.setEnabled(False)
+        self._info_thread = QThread()
+        self._info_worker = ReadInfoWorker(self._backend)
+        self._info_worker.moveToThread(self._info_thread)
+        self._info_thread.started.connect(self._info_worker.run)
+        self._info_worker.finished.connect(self._info_thread.quit)
+        self._info_worker.finished.connect(self._info_worker.deleteLater)
+        self._info_thread.finished.connect(self._on_info_thread_finished)
+        self._info_worker.info_ready.connect(self._on_info_ready)
+        self._info_worker.failed.connect(self._on_info_failed)
+        self._info_thread.start()
+
+    @Slot(int, int, bool)
+    def _on_info_ready(self, version: int, pid: int, ext_erase: bool) -> None:
+        self._append_log(f"Bootloader 版本: 0x{version:02X}")
+        self._append_log(f"芯片 PID: 0x{pid:04X}")
+        self._append_log(f"扩展擦除: {'是' if ext_erase else '否'}")
+        QMessageBox.information(
+            self, "Bootloader 信息",
+            f"Bootloader 版本: 0x{version:02X}\n"
+            f"芯片 PID: 0x{pid:04X}\n"
+            f"扩展擦除: {'是' if ext_erase else '否'}"
+        )
+
+    @Slot(str)
+    def _on_info_failed(self, msg: str) -> None:
+        self._append_log(f"读取失败: {msg}")
+        QMessageBox.critical(self, "Bootloader", f"读取失败: {msg}")
+
+    @Slot()
+    def _on_info_thread_finished(self) -> None:
+        self._info_thread = None
+        self._info_worker = None
+        self._btn_read_info.setEnabled(True)
 
     @Slot()
     def _send_bootloader_cmd(self) -> None:
@@ -426,20 +488,39 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "命令", str(e))
             return
         self._save_settings()
-        try:
-            self._backend.reset_input_buffer()
-            self._backend.write(payload)
-            self._append_log(f"进入bootloader模式: {payload.hex(' ')}")
-            time.sleep(0.1)
-            resp = self._backend.read(7)
-            expected = bytes([0x55, 0xAA, 0xAA, 0x55, 0x02, 0x00, 0x01])
-            if resp == expected:
-                self._append_log(f"进入bootloader模式成功: {resp.hex(' ')}")
-            else:
-                self._append_log(f"进入bootloader模式失败: {resp.hex(' ')}")
-                QMessageBox.warning(self, "Bootloader", f"进入bootloader模式失败\n期望: {expected.hex(' ')}\n收到: {resp.hex(' ')}")
-        except OSError as e:
-            QMessageBox.critical(self, "串口", str(e))
+        self._btn_boot.setEnabled(False)
+        self._append_log(f"进入bootloader模式: {payload.hex(' ')}")
+        self._boot_thread = QThread()
+        self._boot_worker = BootCmdWorker(self._backend, payload)
+        self._boot_worker.moveToThread(self._boot_thread)
+        self._boot_thread.started.connect(self._boot_worker.run)
+        self._boot_worker.finished.connect(self._boot_thread.quit)
+        self._boot_worker.finished.connect(self._boot_worker.deleteLater)
+        self._boot_thread.finished.connect(self._on_boot_thread_finished)
+        self._boot_worker.replied.connect(self._on_boot_replied)
+        self._boot_worker.failed.connect(self._on_boot_failed)
+        self._boot_thread.start()
+
+    @Slot(bytes)
+    def _on_boot_replied(self, resp: bytes) -> None:
+        expected = bytes([0x55, 0xAA, 0xAA, 0x55, 0x02, 0x00, 0x01])
+        if resp == expected:
+            self._append_log(f"进入bootloader模式成功: {resp.hex(' ')}")
+            QMessageBox.information(self, "Bootloader", "进入bootloader模式成功")
+        else:
+            self._append_log(f"进入bootloader模式失败: {resp.hex(' ')}")
+            QMessageBox.warning(self, "Bootloader", f"进入bootloader模式失败\n期望: {expected.hex(' ')}\n收到: {resp.hex(' ')}")
+
+    @Slot(str)
+    def _on_boot_failed(self, msg: str) -> None:
+        self._append_log(f"发送失败: {msg}")
+        QMessageBox.critical(self, "串口", msg)
+
+    @Slot()
+    def _on_boot_thread_finished(self) -> None:
+        self._boot_thread = None
+        self._boot_worker = None
+        self._btn_boot.setEnabled(True)
 
     @Slot()
     def _browse_bin(self) -> None:
@@ -474,9 +555,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._save_settings()
-        if self._flash_thread and self._flash_thread.isRunning():
-            self._flash_thread.quit()
-            self._flash_thread.wait(3000)
+        for thread in (self._flash_thread, self._info_thread, self._boot_thread):
+            if thread and thread.isRunning():
+                thread.quit()
+                thread.wait(3000)
         self._backend.close()
         super().closeEvent(event)
 
@@ -511,6 +593,7 @@ class MainWindow(QMainWindow):
         self._save_settings()
         self._btn_flash.setEnabled(False)
         self._btn_boot.setEnabled(False)
+        self._btn_cancel.setEnabled(True)
         self._progress.setValue(0)
 
         self._flash_thread = QThread()
@@ -524,8 +607,15 @@ class MainWindow(QMainWindow):
         self._flash_worker.progress.connect(self._on_flash_progress)
         self._flash_worker.failed.connect(self._on_flash_failed)
         self._flash_worker.success.connect(self._on_flash_success)
+        self._flash_worker.cancelled.connect(self._on_flash_cancelled)
 
         self._flash_thread.start()
+
+    @Slot()
+    def _cancel_flash(self) -> None:
+        if self._flash_worker is not None:
+            self._flash_worker.cancel()
+            self._append_log("取消中，将在当前块写入后停止...")
 
     @Slot()
     def _on_flash_thread_finished(self) -> None:
@@ -533,6 +623,11 @@ class MainWindow(QMainWindow):
         self._flash_worker = None
         self._btn_flash.setEnabled(True)
         self._btn_boot.setEnabled(True)
+        self._btn_cancel.setEnabled(False)
+
+    @Slot()
+    def _on_flash_cancelled(self) -> None:
+        QMessageBox.information(self, "已取消", "烧录已取消，Flash 可能只写入了部分数据，请重新烧录。")
 
     @Slot(str)
     def _on_flash_failed(self, msg: str) -> None:

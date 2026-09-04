@@ -66,15 +66,6 @@ class Stm32UartBootloader:
     def _cmd_pair(self, cmd: int) -> bytes:
         return bytes([cmd, cmd ^ 0xFF])
 
-    def cmd_get_version(self) -> int:
-        self._send_cmd(0x00, "Get (0x00)")
-        data = self._ser.read(2)
-        if len(data) < 2:
-            raise BootloaderError("Get: short response")
-        version = data[0]
-        self._wait_ack("Get end")
-        return version
-
     def sync(self, retries: int = 5, delay_s: float = 0.05) -> None:
         """Init (0x7F) then Get (0x00 0xFF) to sync with bootloader and get version."""
         last_exception: Optional[Exception] = None
@@ -122,26 +113,6 @@ class Stm32UartBootloader:
             time.sleep(delay_s)
         raise BootloaderError(f"Sync failed after {retries} attempts: {last_exception}")
 
-    def cmd_get(self) -> int:
-        """Return bootloader version."""
-        self._ser.write(bytes([0x00, 0xFF]))
-        ack = self._ser.read(1)
-        if not ack or ack[0] != ACK:
-            raise BootloaderError(f"Get: expected ACK, got {ack.hex() if ack else 'None'}")
-        
-        v = self._ser.read(1)
-        if len(v) != 1:
-            raise BootloaderError("Get: short response")
-        version = v[0]
-        
-        self._ser.reset_input_buffer()
-        return version
-
-    def cmd_get_id_v2(self, addr: int) -> None:
-        """Send address: 0x08 0x00 0x00 0x00 0x08"""
-        self._ser.write(bytes([0x08, 0x00, 0x00, 0x00, 0x08]))
-        self._wait_ack("Address")
-
     def cmd_get_id(self) -> int:
         """Return chip PID."""
         self._send_cmd(0x02, "GetID (0x02)")
@@ -167,27 +138,18 @@ class Stm32UartBootloader:
         return bytes([b3, b2, b1, b0, crc])
 
     def cmd_erase_all(self) -> None:
-        """Mass erase using page erase (0x44)."""
+        """Global mass erase via Extended Erase (0x44, special code 0xFFFF)."""
         self._ser.write(bytes([0x44]))
         time.sleep(0.00019)
         self._ser.write(bytes([0xBB]))
         self._wait_ack("Erase cmd")
-        
-        erase_cmd = bytes([
-            0x00, 0x03,
-            0x00, 0x00,
-            0x00, 0x01,
-            0x00, 0x02,
-            0x00, 0x03,
-            0x03, 0x03
-        ])
-        
-        self._ser.write(erase_cmd)
-        
+
+        # N=0xFFFF 表示全局擦除（不分页）；XOR 校验字节 0x00。
+        self._ser.write(bytes([0xFF, 0xFF, 0x00]))
+
         old = self._ser.timeout
         self._ser.timeout = max(old, 30.0)
         try:
-            time.sleep(0.7)
             self._wait_ack("Extended Erase")
         finally:
             self._ser.timeout = old
@@ -210,10 +172,6 @@ class Stm32UartBootloader:
         data_crc = n
         for b in data:
             data_crc ^= b
-        
-        addr_crc = encoded_addr[4] if len(encoded_addr) > 4 else (addr & 0xFF)
-        print(f"[WRITE] addr=0x{addr:08X} addr_encoded={encoded_addr.hex()} n=0x{n:02X} data_len={len(data)} data_crc=0x{data_crc:02X}")
-        print(f"[WRITE] data={data.hex()}")
         
         self._ser.write(data)
         self._ser.write(bytes([data_crc]))
@@ -240,13 +198,45 @@ class Stm32UartBootloader:
             if progress:
                 progress(offset, total)
 
-    def cmd_read_memory(self, addr: int, length: int) -> bytes:
-        if length > 256 or length == 0:
-            raise ValueError("Read chunk must be 1..256 bytes")
-        
+    def wait_bootloader_ready(self, retries: int = 15, delay_s: float = 0.2) -> None:
+        """Repeat the 0x7F activation until the ROM bootloader answers.
+
+        Use after entering bootloader mode (BOOT0 / firmware jump) instead of
+        a fixed sleep. Raises BootloaderError when all attempts fail.
+        """
+        last: Optional[Exception] = None
+        for _ in range(retries):
+            try:
+                self.sync(retries=1, delay_s=0.05)
+                return
+            except BootloaderError as e:
+                last = e
+                time.sleep(delay_s)
+        raise BootloaderError(f"未检测到 Bootloader 应答 (0x7F): {last}")
+
+    def probe(self, addr: int = 0x08000000) -> int:
+        """Legacy handshake: partial Read Memory of 1 byte to confirm the MCU
+        is alive in ROM bootloader. Returns the data byte read."""
         self._ser.write(bytes([0x11]))
         time.sleep(1.0)
         self._ser.write(bytes([0xEE]))
+        self._wait_ack("Probe read cmd")
+
+        self._ser.write(self._encode_addr(addr))
+        self._wait_ack("Probe address")
+
+        # Complete the Read Memory command with length=1 (N-1=0x00).
+        self._ser.write(bytes([0x00, 0xFF]))
+        resp = self._ser.read(2)
+        if len(resp) < 2 or resp[0] != ACK:
+            raise BootloaderError(f"Probe: expected ACK, got {resp.hex() if resp else 'None'}")
+        return resp[1]
+
+    def cmd_read_memory(self, addr: int, length: int) -> bytes:
+        if length > 256 or length == 0:
+            raise ValueError("Read chunk must be 1..256 bytes")
+
+        self._ser.write(bytes([0x11, 0xEE]))
         self._wait_ack("Read cmd")
         
         self._ser.write(self._encode_addr(addr))
@@ -260,15 +250,6 @@ class Stm32UartBootloader:
         if len(out) != length:
             raise BootloaderError("ReadMemory: short data")
         return out
-
-    def read_memory_stream(self, addr: int, length: int) -> bytes:
-        out = bytearray()
-        while length > 0:
-            n = min(256, length)
-            out += self.cmd_read_memory(addr, n)
-            addr += n
-            length -= n
-        return bytes(out)
 
     def verify(
         self,

@@ -1,1 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# PyInstaller
+build/
+dist/
+
+# IDE
+.idea/
+
+# Windows 保留设备名：git 会把 nul 解析为 NUL 设备产生幻影未跟踪条目
 nul
