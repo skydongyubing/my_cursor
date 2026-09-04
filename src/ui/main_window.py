@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import shutil
+import sys
 import threading
 import time
 from pathlib import Path
@@ -10,7 +12,7 @@ from typing import List, Optional
 
 import serial
 import serial.tools.list_ports
-from PySide6.QtCore import QObject, QSettings, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QSettings, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -24,6 +26,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
@@ -33,6 +36,13 @@ from PySide6.QtWidgets import (
 from src.serial_backend import SerialBackend, parity_from_string, parity_to_label
 from src.stm32_uart_bootloader import BootloaderError, Stm32UartBootloader
 from src.intel_hex import HexSegment, parse_intel_hex
+from src.updater import (
+    APP_VERSION,
+    UpdateCheckWorker,
+    UpdateDownloadWorker,
+    is_new_version,
+    launch_replace,
+)
 
 
 def _parse_hex_bytes(text: str) -> bytes:
@@ -242,7 +252,7 @@ class FlashWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("WYJ PROGRAM")
+        self.setWindowTitle(f"WYJ PROGRAM v{APP_VERSION}")
         self.resize(720, 560)
         self._backend = SerialBackend()
         self._flash_thread: Optional[QThread] = None
@@ -251,6 +261,11 @@ class MainWindow(QMainWindow):
         self._info_worker: Optional[ReadInfoWorker] = None
         self._boot_thread: Optional[QThread] = None
         self._boot_worker: Optional[BootCmdWorker] = None
+        self._updchk_thread: Optional[QThread] = None
+        self._updchk_worker: Optional[UpdateCheckWorker] = None
+        self._upddl_thread: Optional[QThread] = None
+        self._upddl_worker: Optional[UpdateDownloadWorker] = None
+        self._upd_prog: Optional[QProgressDialog] = None
         self._settings = QSettings("STM32UartProgrammer", "MainWindow")
         self._port_watch = QTimer(self)
         self._port_watch.setInterval(1000)
@@ -355,6 +370,8 @@ class MainWindow(QMainWindow):
 
         self._refresh_ports()
         self._restore_port_selection()
+        # 启动 1.5s 后自动检查更新（后台线程，失败仅记日志不打扰）
+        QTimer.singleShot(1500, self._check_for_update)
 
     def _restore_port_selection(self) -> None:
         last = self._settings.value("last_port", "", str)
@@ -467,6 +484,105 @@ class MainWindow(QMainWindow):
         self._port_watch.stop()
         self._append_log("检测到串口断开（设备拔出或失效）")
         self._disconnect()
+
+    # ---------------- 在线升级 ----------------
+
+    @Slot()
+    def _check_for_update(self) -> None:
+        if self._updchk_thread is not None:
+            return
+        self._updchk_thread = QThread()
+        self._updchk_worker = UpdateCheckWorker()
+        self._updchk_worker.moveToThread(self._updchk_thread)
+        self._updchk_thread.started.connect(self._updchk_worker.run)
+        self._updchk_worker.check_done.connect(self._on_update_manifest)
+        self._updchk_worker.check_failed.connect(
+            lambda m: self._append_log(f"检查更新失败: {m}")
+        )
+        self._updchk_worker.check_done.connect(self._updchk_thread.quit)
+        self._updchk_worker.check_failed.connect(self._updchk_thread.quit)
+        self._updchk_thread.finished.connect(self._updchk_worker.deleteLater)
+        self._updchk_thread.finished.connect(self._on_updchk_thread_finished)
+        self._updchk_thread.start()
+
+    @Slot(dict)
+    def _on_update_manifest(self, info: dict) -> None:
+        if not is_new_version(info["version"]):
+            self._append_log(f"当前已是最新版本 v{APP_VERSION}")
+            return
+        self._append_log(f"发现新版本 v{info['version']}（当前 v{APP_VERSION}）")
+        text = (
+            f"发现新版本 v{info['version']}，是否下载升级？\n"
+            f"当前版本 v{APP_VERSION}"
+        )
+        if info.get("notes"):
+            text += f"\n\n更新说明：{info['notes']}"
+        if QMessageBox.question(self, "在线升级", text) != QMessageBox.Yes:
+            self._append_log("已跳过本次更新")
+            return
+        self._start_update_download(info)
+
+    def _start_update_download(self, info: dict) -> None:
+        self._upd_prog = QProgressDialog("正在下载更新...", None, 0, 100, self)
+        self._upd_prog.setWindowTitle("在线升级")
+        self._upd_prog.setWindowModality(Qt.WindowModal)
+        self._upd_prog.setMinimumDuration(0)
+        self._upd_prog.setValue(0)
+        self._upddl_thread = QThread()
+        self._upddl_worker = UpdateDownloadWorker(info["url"], info["sha256"])
+        self._upddl_worker.moveToThread(self._upddl_thread)
+        self._upddl_thread.started.connect(self._upddl_worker.run)
+        self._upddl_worker.progress.connect(self._on_update_progress)
+        self._upddl_worker.downloaded.connect(self._on_update_downloaded)
+        self._upddl_worker.failed.connect(self._on_update_failed)
+        self._upddl_worker.downloaded.connect(self._upddl_thread.quit)
+        self._upddl_worker.failed.connect(self._upddl_thread.quit)
+        self._upddl_thread.finished.connect(self._upddl_worker.deleteLater)
+        self._upddl_thread.finished.connect(self._on_upddl_thread_finished)
+        self._upddl_thread.start()
+
+    @Slot(int, int)
+    def _on_update_progress(self, recv: int, total: int) -> None:
+        if self._upd_prog is None:
+            return
+        if total <= 0:
+            self._upd_prog.setRange(0, 0)
+            return
+        self._upd_prog.setRange(0, 100)
+        self._upd_prog.setValue(int(recv * 100 / total))
+        self._upd_prog.setLabelText(
+            f"正在下载更新... {recv / 1048576:.1f} / {total / 1048576:.1f} MB"
+        )
+
+    @Slot(object)
+    def _on_update_downloaded(self, path) -> None:
+        if self._upd_prog is not None:
+            self._upd_prog.close()
+        if not getattr(sys, "frozen", False):
+            self._append_log(f"开发模式：新版本已下载到 {path}，不自动替换")
+            return
+        target = Path(sys.executable)
+        new_local = target.with_name(target.name + ".new")
+        shutil.move(str(path), str(new_local))
+        self._append_log("下载完成，正在重启升级...")
+        launch_replace(new_local, target)
+        self.close()
+
+    @Slot(str)
+    def _on_update_failed(self, msg: str) -> None:
+        if self._upd_prog is not None:
+            self._upd_prog.close()
+        self._append_log(f"在线升级失败: {msg}")
+
+    @Slot()
+    def _on_updchk_thread_finished(self) -> None:
+        self._updchk_thread = None
+        self._updchk_worker = None
+
+    @Slot()
+    def _on_upddl_thread_finished(self) -> None:
+        self._upddl_thread = None
+        self._upddl_worker = None
 
     @Slot()
     def _read_bootloader_info(self) -> None:
@@ -587,7 +703,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         self._save_settings()
         self._port_watch.stop()
-        for thread in (self._flash_thread, self._info_thread, self._boot_thread):
+        for thread in (self._flash_thread, self._info_thread, self._boot_thread,
+                       self._updchk_thread, self._upddl_thread):
             if thread and thread.isRunning():
                 thread.quit()
                 thread.wait(3000)
