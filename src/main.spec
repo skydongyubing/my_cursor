@@ -43,5 +43,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=os.path.join(ROOT, "威宇佳烧录工具.ico"),
+    icon=os.path.join(ROOT, "icon_chip.ico"),
 )
