@@ -13,7 +13,7 @@ a = Analysis(
     ["main.py"],
     pathex=[ROOT],
     binaries=[],
-    datas=[],
+    datas=[(os.path.join(ROOT, "icon_chip.ico"), ".")],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

@@ -2,10 +2,19 @@
 """STM32F407 UART programmer — application entry."""
 
 import sys
+from pathlib import Path
 
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 from src.ui.main_window import MainWindow
+
+
+def _icon_path() -> Path:
+    # frozen: PyInstaller onefile unpack dir (datas bundle); dev: repo root
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", "")) / "icon_chip.ico"
+    return Path(__file__).resolve().parent.parent / "icon_chip.ico"
 
 DARK_STYLESHEET = """
 QWidget {
@@ -123,6 +132,9 @@ QMessageBox QPushButton {
 def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("STM32 UART Programmer")
+    icon = _icon_path()
+    if icon.is_file():
+        app.setWindowIcon(QIcon(str(icon)))  # title bar + taskbar
     app.setStyleSheet(DARK_STYLESHEET)
     w = MainWindow()
     w.show()
