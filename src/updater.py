@@ -25,7 +25,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
-APP_VERSION = "1.4"
+APP_VERSION = "1.6"
 
 # 升级 manifest 地址（Gitee 仓库 raw 文件，发布新版时更新仓库里的 latest.json）
 MANIFEST_URL = "https://gitee.com/dongyubingsky/dongyubingsky/raw/master/latest.json"

@@ -30,7 +30,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="威宇佳烧录1.4",
+    name="威宇佳烧录",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
